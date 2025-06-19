@@ -1,5 +1,6 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile } from 'obsidian';
 import * as yaml from 'js-yaml';
+import OpenAI from 'openai';
 
 // Remember to rename these classes and interfaces!
 
@@ -8,6 +9,8 @@ export interface AutoflowPluginSettings {
 	apiKey: string;
 	/** Model name, e.g. gpt-3.5-turbo */
 	model: string;
+	/** Embedding model name, e.g. text-embedding-3-small */
+	embeddingModel: string;
 	/** Sampling temperature (0-2) */
 	temperature: number;
 }
@@ -15,6 +18,7 @@ export interface AutoflowPluginSettings {
 export const DEFAULT_SETTINGS: AutoflowPluginSettings = {
 	apiKey: '',
 	model: 'gpt-4o',
+	embeddingModel: 'text-embedding-3-small',
 	temperature: 0.7
 };
 
@@ -96,11 +100,39 @@ export function parseFlowDefinition(text: string): FlowDefinition | Error {
     }
 }
 
+function cosineSimilarity(vecA: number[], vecB: number[]): number {
+    if (vecA.length !== vecB.length) {
+        return -1;
+    }
+    const dotProduct = vecA.reduce((acc, val, i) => acc + val * vecB[i], 0);
+    const magA = Math.sqrt(vecA.reduce((acc, val) => acc + val * val, 0));
+    const magB = Math.sqrt(vecB.reduce((acc, val) => acc + val * val, 0));
+    if (magA === 0 || magB === 0) {
+        return 0;
+    }
+    return dotProduct / (magA * magB);
+}
+
+export interface EmbeddingIndex {
+    [filePath: string]: {
+        embedding: number[];
+        mtime: number;
+    };
+}
+
 export default class AutoflowPlugin extends Plugin {
 	settings: AutoflowPluginSettings;
+	openai: OpenAI;
+	embeddingIndex: EmbeddingIndex = {};
+	embeddingIndexPath: string;
 
 	async onload() {
 		await this.loadSettings();
+
+		this.updateOpenAIClient();
+
+		this.embeddingIndexPath = `${this.app.vault.configDir}/plugins/autoflow/embedding-index.json`;
+		this.loadEmbeddingIndex();
 
 		// This creates an icon in the left ribbon.
 		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
@@ -174,12 +206,34 @@ export default class AutoflowPlugin extends Plugin {
 
 	}
 
+	updateOpenAIClient() {
+		this.openai = new OpenAI({
+			apiKey: this.settings.apiKey,
+			dangerouslyAllowBrowser: true
+		});
+	}
+
 	async loadSettings() {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	async loadEmbeddingIndex() {
+		if (await this.app.vault.adapter.exists(this.embeddingIndexPath)) {
+			const data = await this.app.vault.adapter.read(this.embeddingIndexPath);
+			this.embeddingIndex = JSON.parse(data);
+		}
+	}
+
+	async saveEmbeddingIndex() {
+		const dir = this.embeddingIndexPath.substring(0, this.embeddingIndexPath.lastIndexOf('/'));
+		if (!await this.app.vault.adapter.exists(dir)) {
+			await this.app.vault.adapter.mkdir(dir);
+		}
+		await this.app.vault.adapter.write(this.embeddingIndexPath, JSON.stringify(this.embeddingIndex, null, 2));
 	}
 
 	async pickAndRunFlow() {
@@ -226,22 +280,77 @@ export default class AutoflowPlugin extends Plugin {
 		}
 	}
 
+	async getEmbedding(text: string): Promise<number[]> {
+		if (!this.settings.apiKey) {
+			new Notice('OpenAI API key is not set.');
+			throw new Error('API key not set');
+		}
+
+		try {
+			const response = await this.openai.embeddings.create({
+				model: this.settings.embeddingModel,
+				input: text.replace(/\\n/g, ' '),
+			});
+
+			return response.data[0].embedding;
+		} catch (error) {
+			new Notice('Failed to generate embedding. See console for details.');
+			console.error('Embedding generation error:', error);
+			throw error;
+		}
+	}
+
 	async executeSearchStep(step: SearchStep, context: Record<string, any>) {
 		const files = this.app.vault.getMarkdownFiles()
 			.filter(f => f.path.startsWith(step.sourceFolder));
 
-		let filteredFiles = files;
 		const query = step.query;
-		if (query) {
-			filteredFiles = files.filter(f => f.name.toLowerCase().includes(query.toLowerCase()));
+		if (!query) {
+			// No query, return all files in source folder.
+			const contents = await Promise.all(
+				files.map(file => this.app.vault.cachedRead(file))
+			);
+			context.searchResults = contents;
+			context.searchResultsFiles = files;
+			return;
 		}
 
+		// With query, use embeddings
+		const queryEmbedding = await this.getEmbedding(query);
+
+		const fileEmbeddings: { file: TFile, similarity: number }[] = [];
+
+		for (const file of files) {
+			let fileEmbedding: number[];
+
+			if (this.embeddingIndex[file.path] && this.embeddingIndex[file.path].mtime === file.stat.mtime) {
+				fileEmbedding = this.embeddingIndex[file.path].embedding;
+			} else {
+				const content = await this.app.vault.cachedRead(file);
+				fileEmbedding = await this.getEmbedding(content);
+				this.embeddingIndex[file.path] = {
+					embedding: fileEmbedding,
+					mtime: file.stat.mtime
+				};
+			}
+
+			const similarity = cosineSimilarity(queryEmbedding, fileEmbedding);
+			fileEmbeddings.push({ file, similarity });
+		}
+
+		await this.saveEmbeddingIndex();
+
+		fileEmbeddings.sort((a, b) => b.similarity - a.similarity);
+
+		const topN = 10;
+		const topFiles = fileEmbeddings.slice(0, topN).map(f => f.file);
+
 		const contents = await Promise.all(
-			filteredFiles.map(file => this.app.vault.cachedRead(file))
+			topFiles.map(file => this.app.vault.cachedRead(file))
 		);
 
 		context.searchResults = contents;
-		context.searchResultsFiles = filteredFiles;
+		context.searchResultsFiles = topFiles;
 	}
 
 	async executeTransformStep(step: TransformStep, context: Record<string, any>) {
@@ -254,28 +363,25 @@ export default class AutoflowPlugin extends Plugin {
 
 		const prompt = `${step.prompt}\\n\\n${content}`;
 
-		const response = await fetch('https://api.openai.com/v1/chat/completions', {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'Authorization': `Bearer ${this.settings.apiKey}`
-			},
-			body: JSON.stringify({
+		if (!this.settings.apiKey) {
+			new Notice('OpenAI API key not set.');
+			return;
+		}
+		try {
+			const response = await this.openai.chat.completions.create({
 				model: this.settings.model,
 				temperature: this.settings.temperature,
 				messages: [
 					{ role: 'user', content: prompt }
 				]
-			})
-		});
+			});
 
-		if (!response.ok) {
-			const errorText = await response.text();
-			throw new Error(`OpenAI API Error: ${response.statusText} - ${errorText}`);
+			context.transformResult = response.choices[0].message.content;
+		} catch (error) {
+			new Notice('OpenAI API Error. See console for details.');
+			console.error('OpenAI API Error:', error);
+			throw error;
 		}
-
-		const data = await response.json();
-		context.transformResult = data.choices[0].message.content;
 	}
 
 	async executeWriteStep(step: WriteStep, context: Record<string, any>) {
@@ -322,17 +428,30 @@ class AutoflowSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.apiKey = value;
 					await this.plugin.saveSettings();
+					this.plugin.updateOpenAIClient();
 				}));
 
 		// Model
 		new Setting(containerEl)
 			.setName('Model')
-			.setDesc('OpenAI model to use')
+			.setDesc('OpenAI model to use for text generation')
 			.addText(text => text
 				.setPlaceholder('gpt-3.5-turbo')
 				.setValue(this.plugin.settings.model)
 				.onChange(async (value) => {
 					this.plugin.settings.model = value;
+					await this.plugin.saveSettings();
+				}));
+
+		// Embedding Model
+		new Setting(containerEl)
+			.setName('Embedding Model')
+			.setDesc('OpenAI model to use for embeddings')
+			.addText(text => text
+				.setPlaceholder('text-embedding-3-small')
+				.setValue(this.plugin.settings.embeddingModel)
+				.onChange(async (value) => {
+					this.plugin.settings.embeddingModel = value;
 					await this.plugin.saveSettings();
 				}));
 
