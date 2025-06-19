@@ -1,4 +1,4 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile } from 'obsidian';
+import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile, TFolder } from 'obsidian';
 import * as yaml from 'js-yaml';
 import OpenAI from 'openai';
 
@@ -7,7 +7,7 @@ import OpenAI from 'openai';
 export interface AutoflowPluginSettings {
 	/** OpenAI or compatible API key */
 	apiKey: string;
-	/** Model name, e.g. gpt-3.5-turbo */
+	/** Model name, e.g. gpt-4.1 */
 	model: string;
 	/** Embedding model name, e.g. text-embedding-3-small */
 	embeddingModel: string;
@@ -17,7 +17,7 @@ export interface AutoflowPluginSettings {
 
 export const DEFAULT_SETTINGS: AutoflowPluginSettings = {
 	apiKey: '',
-	model: 'gpt-4o',
+	model: 'gpt-4.1',
 	embeddingModel: 'text-embedding-3-small',
 	temperature: 0.7
 };
@@ -52,49 +52,58 @@ export interface FlowDefinition {
 
 export function parseFlowDefinition(text: string): FlowDefinition | Error {
     try {
-        const data = yaml.load(text) as any;
-        if (!data) {
+        const data: unknown = yaml.load(text);
+
+        if (typeof data !== 'object' || data === null) {
             return new Error('Flow Definition is empty or invalid YAML.');
         }
+        
+        const flow = data as Record<string, unknown>;
 
-        if (!data.name || typeof data.name !== 'string') {
+        if (!flow.name || typeof flow.name !== 'string') {
             return new Error('Flow Definition missing required field "name" or it is not a string.');
         }
 
-        if (!data.description || typeof data.description !== 'string') {
+        if (!flow.description || typeof flow.description !== 'string') {
             return new Error('Flow Definition missing required field "description" or it is not a string.');
         }
 
-        if (!data.steps || !Array.isArray(data.steps)) {
+        if (!flow.steps || !Array.isArray(flow.steps)) {
             return new Error('Flow Definition missing required field "steps" or it is not an array.');
         }
 
-        for (const step of data.steps) {
-            if (!step.type || typeof step.type !== 'string') {
+        for (const step of flow.steps) {
+            if (typeof step !== 'object' || step === null) {
+                return new Error('A step is not a valid object.');
+            }
+
+            const stepRecord = step as Record<string, unknown>;
+
+            if (!stepRecord.type || typeof stepRecord.type !== 'string') {
                 return new Error('A step is missing the "type" field.');
             }
-            switch (step.type) {
+            switch (stepRecord.type) {
                 case 'search':
-                    if (!step.sourceFolder || typeof step.sourceFolder !== 'string') {
+                    if (!stepRecord.sourceFolder || typeof stepRecord.sourceFolder !== 'string') {
                         return new Error('Search step is missing "sourceFolder".');
                     }
                     break;
                 case 'transform':
-                    if (!step.prompt || typeof step.prompt !== 'string') {
+                    if (!stepRecord.prompt || typeof stepRecord.prompt !== 'string') {
                         return new Error('Transform step is missing "prompt".');
                     }
                     break;
                 case 'write':
-                    if (!step.targetFile || typeof step.targetFile !== 'string') {
+                    if (!stepRecord.targetFile || typeof stepRecord.targetFile !== 'string') {
                         return new Error('Write step is missing "targetFile".');
                     }
                     break;
                 default:
-                    return new Error(`Unknown step type: ${step.type}`);
+                    return new Error(`Unknown step type: ${stepRecord.type}`);
             }
         }
 
-        return data as FlowDefinition;
+        return flow as unknown as FlowDefinition;
     } catch (e) {
         return e instanceof Error ? e : new Error('Failed to parse YAML.');
     }
@@ -134,72 +143,20 @@ export default class AutoflowPlugin extends Plugin {
 		this.embeddingIndexPath = `${this.app.vault.configDir}/plugins/autoflow/embedding-index.json`;
 		this.loadEmbeddingIndex();
 
-		// This creates an icon in the left ribbon.
-		const ribbonIconEl = this.addRibbonIcon('dice', 'Sample Plugin', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
-		});
-		// Perform additional things with the ribbon
-		ribbonIconEl.addClass('my-plugin-ribbon-class');
-
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status Bar Text');
-
 		this.addCommand({
 			id: 'run-autoflow',
 			name: 'Run Autoflow',
 			callback: () => this.pickAndRunFlow()
 		});
 
-		// This adds a simple command that can be triggered anywhere
 		this.addCommand({
-			id: 'open-sample-modal-simple',
-			name: 'Open sample modal (simple)',
-			callback: () => {
-				new Notice("Hello from autoflow!");
-			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'sample-editor-command',
-			name: 'Sample editor command',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				console.log(editor.getSelection());
-				editor.replaceSelection('Sample Editor Command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-sample-modal-complex',
-			name: 'Open sample modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new Notice("Hello from autoflow (complex)!");
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-			}
+			id: 'rebuild-ai-index',
+			name: 'Rebuild AI Index',
+			callback: () => this.pickAndRebuildIndex()
 		});
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new AutoflowSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			console.log('click', evt);
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
 	}
 
 	onunload() {
@@ -252,10 +209,56 @@ export default class AutoflowPlugin extends Plugin {
 		modal.open();
 	}
 
+	async pickAndRebuildIndex() {
+		const folders = this.app.vault.getAllLoadedFiles()
+			.filter((f): f is TFolder => f instanceof TFolder);
+
+		new FolderPickerModal(this.app, folders, async (folder) => {
+			new Notice(`Rebuilding index for ${folder.path}...`);
+			const count = await this.rebuildIndexForFolder(folder.path);
+			new Notice(`Rebuilding index for ${folder.path} complete. ${count} files indexed.`);
+		}).open();
+	}
+
+	async rebuildIndexForFolder(folderPath: string): Promise<number> {
+		const files = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(folderPath));
+		let count = 0;
+
+		for (const file of files) {
+			const content = await this.app.vault.cachedRead(file);
+			const fileEmbedding = await this.getEmbedding(content);
+			this.embeddingIndex[file.path] = {
+				embedding: fileEmbedding,
+				mtime: file.stat.mtime
+			};
+			count++;
+		}
+
+		await this.saveEmbeddingIndex();
+		return count;
+	}
+
+	async logError(error: Error) {
+		const logDir = `${this.app.vault.configDir}/plugins/autoflow/logs`;
+		if (!await this.app.vault.adapter.exists(logDir)) {
+			await this.app.vault.adapter.mkdir(logDir);
+		}
+		const logPath = `${logDir}/latest.log`;
+		const timestamp = new Date().toISOString();
+		const logMessage = `
+---
+Timestamp: ${timestamp}
+Error: ${error.message}
+Stack Trace:
+${error.stack}
+---`;
+		await this.app.vault.adapter.append(logPath, logMessage);
+	}
+
 	async runSteps(definition: FlowDefinition) {
 		const statusBar = this.addStatusBarItem();
 		statusBar.setText('Autoflow: Running...');
-		const context: Record<string, any> = {};
+		const context: Record<string, unknown> = {};
 
 		try {
 			for (const step of definition.steps) {
@@ -273,8 +276,11 @@ export default class AutoflowPlugin extends Plugin {
 			}
 			new Notice('Flow execution finished.');
 		} catch (error) {
-			new Notice('Flow execution failed. See console for details.');
+			new Notice('Flow execution failed. See logs for details.');
 			console.error('Autoflow execution error:', error);
+			if (error instanceof Error) {
+				await this.logError(error);
+			}
 		} finally {
 			statusBar.remove();
 		}
@@ -300,7 +306,7 @@ export default class AutoflowPlugin extends Plugin {
 		}
 	}
 
-	async executeSearchStep(step: SearchStep, context: Record<string, any>) {
+	async executeSearchStep(step: SearchStep, context: Record<string, unknown>) {
 		const files = this.app.vault.getMarkdownFiles()
 			.filter(f => f.path.startsWith(step.sourceFolder));
 
@@ -353,7 +359,7 @@ export default class AutoflowPlugin extends Plugin {
 		context.searchResultsFiles = topFiles;
 	}
 
-	async executeTransformStep(step: TransformStep, context: Record<string, any>) {
+	async executeTransformStep(step: TransformStep, context: Record<string, unknown>) {
 		const searchResults = context.searchResults as string[] || [];
 		let content = searchResults.join('\\n\\n---\\n\\n');
 
@@ -384,7 +390,7 @@ export default class AutoflowPlugin extends Plugin {
 		}
 	}
 
-	async executeWriteStep(step: WriteStep, context: Record<string, any>) {
+	async executeWriteStep(step: WriteStep, context: Record<string, unknown>) {
 		const contentToWrite = context.transformResult as string;
 		if (!contentToWrite) {
 			return;
@@ -436,7 +442,7 @@ class AutoflowSettingTab extends PluginSettingTab {
 			.setName('Model')
 			.setDesc('OpenAI model to use for text generation')
 			.addText(text => text
-				.setPlaceholder('gpt-3.5-turbo')
+				.setPlaceholder('gpt-4.1')
 				.setValue(this.plugin.settings.model)
 				.onChange(async (value) => {
 					this.plugin.settings.model = value;
@@ -469,6 +475,24 @@ class AutoflowSettingTab extends PluginSettingTab {
 					})
 					.setDynamicTooltip()
 			);
+	}
+}
+
+class FolderPickerModal extends SuggestModal<TFolder> {
+	constructor(app: App, private folders: TFolder[], private onChoose: (folder: TFolder) => void) {
+		super(app);
+	}
+
+	getSuggestions(query: string): TFolder[] {
+		return this.folders.filter(folder => folder.path.toLowerCase().includes(query.toLowerCase()));
+	}
+
+	renderSuggestion(folder: TFolder, el: HTMLElement) {
+		el.createEl('div', { text: folder.path });
+	}
+
+	onChooseSuggestion(folder: TFolder, evt: MouseEvent | KeyboardEvent) {
+		this.onChoose(folder);
 	}
 }
 
