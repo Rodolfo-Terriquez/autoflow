@@ -1,7 +1,7 @@
 {
 	"id": "autoflow",
 	"name": "Autoflow",
-	"version": "1.0.0",
+	"version": "1.0.1",
 	"minAppVersion": "0.15.0",
 	"description": "Lets your create and execute automated AI workflows.",
 	"author": "Rodolfo Terriquez",
