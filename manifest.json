@@ -1,0 +1,11 @@
+{
+	"id": "autoflow",
+	"name": "Autoflow",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Lets your create and execute automated AI workflows.",
+	"author": "Rodolfo Terriquez",
+	"authorUrl": "https://github.com/Rodolfo-Terriquez",
+	"isDesktopOnly": false,
+	"main": "main.js"
+}
