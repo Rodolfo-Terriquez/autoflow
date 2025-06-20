@@ -1,8 +1,5 @@
-import { App, Editor, MarkdownView, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile, TFolder } from 'obsidian';
-import * as yaml from 'js-yaml';
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile, TFolder } from 'obsidian';
 import OpenAI from 'openai';
-
-// Remember to rename these classes and interfaces!
 
 export interface AutoflowPluginSettings {
 	/** OpenAI or compatible API key */
@@ -13,13 +10,16 @@ export interface AutoflowPluginSettings {
 	embeddingModel: string;
 	/** Sampling temperature (0-2) */
 	temperature: number;
+	/** Show confirmation modal before running a flow */
+	showFlowConfirmation: boolean;
 }
 
 export const DEFAULT_SETTINGS: AutoflowPluginSettings = {
 	apiKey: '',
 	model: 'gpt-4.1',
 	embeddingModel: 'text-embedding-3-small',
-	temperature: 0.7
+	temperature: 0.7,
+	showFlowConfirmation: false
 };
 
 export interface FlowStep {
@@ -50,63 +50,113 @@ export interface FlowDefinition {
     steps: AnyStep[];
 }
 
-export function parseFlowDefinition(text: string): FlowDefinition | Error {
-    try {
-        const data: unknown = yaml.load(text);
+/**
+ * Parse the simplified Autoflow Markdown format introduced in Phase 9.
+ * Expected structure (leading/trailing whitespace is ignored):
+ *
+ * autoflow
+ * name: Example Name
+ * description: "..."
+ * steps:
+ * type: search
+ * - sourceFolder: "Folder"
+ * - query: "something"
+ * type: transform
+ * - prompt: "..."
+ * type: write
+ * - targetFile: "path"
+ */
+export function parseSimpleFlowDefinition(text: string): FlowDefinition | Error {
+    const lines = text.split(/\r?\n/).map(l => l.trim());
 
-        if (typeof data !== 'object' || data === null) {
-            return new Error('Flow Definition is empty or invalid YAML.');
-        }
-        
-        const flow = data as Record<string, unknown>;
+    // Filter out empty comment lines if any
+    const nonEmpty = lines.filter(l => l.length > 0 && !l.startsWith('<!--'));
 
-        if (!flow.name || typeof flow.name !== 'string') {
-            return new Error('Flow Definition missing required field "name" or it is not a string.');
-        }
-
-        if (!flow.description || typeof flow.description !== 'string') {
-            return new Error('Flow Definition missing required field "description" or it is not a string.');
-        }
-
-        if (!flow.steps || !Array.isArray(flow.steps)) {
-            return new Error('Flow Definition missing required field "steps" or it is not an array.');
-        }
-
-        for (const step of flow.steps) {
-            if (typeof step !== 'object' || step === null) {
-                return new Error('A step is not a valid object.');
-            }
-
-            const stepRecord = step as Record<string, unknown>;
-
-            if (!stepRecord.type || typeof stepRecord.type !== 'string') {
-                return new Error('A step is missing the "type" field.');
-            }
-            switch (stepRecord.type) {
-                case 'search':
-                    if (!stepRecord.sourceFolder || typeof stepRecord.sourceFolder !== 'string') {
-                        return new Error('Search step is missing "sourceFolder".');
-                    }
-                    break;
-                case 'transform':
-                    if (!stepRecord.prompt || typeof stepRecord.prompt !== 'string') {
-                        return new Error('Transform step is missing "prompt".');
-                    }
-                    break;
-                case 'write':
-                    if (!stepRecord.targetFile || typeof stepRecord.targetFile !== 'string') {
-                        return new Error('Write step is missing "targetFile".');
-                    }
-                    break;
-                default:
-                    return new Error(`Unknown step type: ${stepRecord.type}`);
-            }
-        }
-
-        return flow as unknown as FlowDefinition;
-    } catch (e) {
-        return e instanceof Error ? e : new Error('Failed to parse YAML.');
+    if (nonEmpty.length === 0) {
+        return new Error('Empty flow definition.');
     }
+
+    if (nonEmpty[0].toLowerCase() !== 'autoflow') {
+        return new Error('Not a simple Autoflow definition.');
+    }
+
+    let idx = 1;
+    const topLevel: Record<string, string> = {};
+    const steps: AnyStep[] = [];
+
+    // Helper to parse "key: value" pairs (with optional leading dash)
+    const kvRegex = /^-?\s*([A-Za-z0-9_]+)\s*:\s*(.*)$/;
+
+    // Parse top-level keys until we hit "steps:" line or end
+    while (idx < nonEmpty.length) {
+        const line = nonEmpty[idx];
+        if (/^steps\s*:/.test(line)) {
+            idx++;
+            break;
+        }
+
+        const kvMatch = line.match(kvRegex);
+        if (!kvMatch) {
+            return new Error(`Invalid top-level line: ${line}`);
+        }
+        const [, key, value] = kvMatch;
+        topLevel[key] = value.replace(/^"|"$/g, '');
+        idx++;
+    }
+
+    let currentStep: Record<string, string> | null = null;
+
+    while (idx < nonEmpty.length) {
+        const line = nonEmpty[idx];
+        if (line.startsWith('type')) {
+            // Save previous step if present
+            if (currentStep) {
+                steps.push(currentStep as unknown as AnyStep);
+            }
+
+            const kvMatch = line.match(kvRegex);
+            if (!kvMatch) {
+                return new Error(`Invalid step type line: ${line}`);
+            }
+            const [, , value] = kvMatch;
+            currentStep = { type: value.replace(/^"|"$/g, '') };
+        } else {
+            if (!currentStep) {
+                return new Error(`Parameter specified before step type: ${line}`);
+            }
+            const kvMatch = line.match(kvRegex);
+            if (!kvMatch) {
+                return new Error(`Invalid parameter line: ${line}`);
+            }
+            const [, key, value] = kvMatch;
+            currentStep[key] = value.replace(/^"|"$/g, '');
+        }
+
+        idx++;
+    }
+
+    // Push last step if exists
+    if (currentStep) {
+        steps.push(currentStep as unknown as AnyStep);
+    }
+
+    if (!topLevel['name'] || !topLevel['description']) {
+        return new Error('Simple flow must have name and description.');
+    }
+
+    if (steps.length === 0) {
+        return new Error('Simple flow must include at least one step.');
+    }
+
+    return {
+        name: topLevel['name'],
+        description: topLevel['description'],
+        steps
+    } as FlowDefinition;
+}
+
+export function parseFlowDefinition(text: string): FlowDefinition | Error {
+    return parseSimpleFlowDefinition(text);
 }
 
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
@@ -144,8 +194,8 @@ export default class AutoflowPlugin extends Plugin {
 		this.loadEmbeddingIndex();
 
 		this.addCommand({
-			id: 'run-autoflow',
-			name: 'Run Autoflow',
+			id: 'run-flow',
+			name: 'Run flow',
 			callback: () => this.pickAndRunFlow()
 		});
 
@@ -200,11 +250,15 @@ export default class AutoflowPlugin extends Plugin {
 			const flowDefinition = parseFlowDefinition(content);
 
 			if (flowDefinition instanceof Error) {
-				new Notice(`Invalid flow definition in ${file.name}: ${flowDefinition.message}`);
+				new Notice(`Invalid flow in ${file.name}: ${flowDefinition.message}. Ensure it starts with the 'autoflow' header.`);
 				return;
 			}
 
-			new FlowSummaryModal(this.app, flowDefinition, this).open();
+			if (this.settings.showFlowConfirmation) {
+				new FlowSummaryModal(this.app, flowDefinition, this).open();
+			} else {
+				await this.runSteps(flowDefinition);
+			}
 		});
 		modal.open();
 	}
@@ -475,6 +529,17 @@ class AutoflowSettingTab extends PluginSettingTab {
 					})
 					.setDynamicTooltip()
 			);
+
+		// Confirmation Toggle
+		new Setting(containerEl)
+			.setName('Confirm before running flow')
+			.setDesc('Show a summary dialog before executing a flow')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.showFlowConfirmation)
+				.onChange(async (value) => {
+					this.plugin.settings.showFlowConfirmation = value;
+					await this.plugin.saveSettings();
+				}));
 	}
 }
 
