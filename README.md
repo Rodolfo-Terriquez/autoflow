@@ -10,6 +10,7 @@ Autoflow allows you to chain together steps to search for notes, transform their
 *   **Semantic Search:** Uses AI embeddings to find notes based on conceptual meaning, not just keywords.
 *   **AI-Powered Content Transformation:** Leverage large language models to summarize, analyze, or reformat your notes.
 *   **External Prompts:** Reference a prompt from another Markdown file, keeping your flow definitions clean and reusable.
+*   **Daily Autorun:** Schedule flows to run automatically once a day when you open your vault.
 *   **Dynamic File Naming:** Automatically include the current date in output filenames.
 *   **Manual Index Control:** A command to manually rebuild the AI search index for any folder.
 
@@ -128,6 +129,26 @@ For complex prompts, you can store the prompt in a separate file and reference i
 
 The plugin will read `Prompts/Summarizer Prompt.md`, use its content as the prompt for the transform step, and write the output to the specified target file.
 
+## Automating Flows on Startup
+
+You can configure a flow to run automatically once per day. The first time you open your vault on a new day, Autoflow will execute any scheduled flows.
+
+To enable this feature, add the `autorun: daily` key to your flow definition.
+
+```text
+autoflow
+name: Daily Work Summary
+description: "Generates a summary of today's work."
+autorun: daily
+lastRun: 2024-01-01
+steps:
+# ... your steps here
+```
+
+**Activation:** To activate the schedule, you must run the flow **manually once**. After that, the plugin will handle the rest automatically. When a flow is set to autorun, a confirmation notice will appear when you run it manually, and a message will be displayed in the summary modal.
+
+The `lastRun` date is added and updated automatically by the plugin. You can also edit this date manually if you need to re-run a flow for a specific day.
+
 ## Flow Commands & Parameters
 
 Below is a reference of all commands (step types) you can use inside an **Autoflow** definition and the parameters each one accepts.
@@ -138,6 +159,8 @@ Below is a reference of all commands (step types) you can use inside an **Autofl
 |-----|------|----------|-------------|
 | `name` | string | yes | The display name of the flow in the UI. |
 | `description` | string | yes | Short explanation of what the flow does. |
+| `autorun` | string | no | Set to `daily` to run the flow automatically once a day. Run the flow once manually to activate. |
+| `lastRun` | string | no | The date the flow was last run automatically (YYYY-MM-DD). This is managed by the plugin and can be edited manually. |
 | `steps` | n/a | yes | One or more **step** definitions listed in the order you want them executed. |
 
 ### Step types

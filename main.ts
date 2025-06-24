@@ -12,6 +12,8 @@ export interface AutoflowPluginSettings {
 	temperature: number;
 	/** Show confirmation modal before running a flow */
 	showFlowConfirmation: boolean;
+	/** A list of vault-relative paths to flows that are configured to autorun. */
+	autorunFlows: string[];
 }
 
 export const DEFAULT_SETTINGS: AutoflowPluginSettings = {
@@ -19,7 +21,8 @@ export const DEFAULT_SETTINGS: AutoflowPluginSettings = {
 	model: 'gpt-4.1',
 	embeddingModel: 'text-embedding-3-small',
 	temperature: 0.7,
-	showFlowConfirmation: false
+	showFlowConfirmation: false,
+	autorunFlows: []
 };
 
 export interface FlowStep {
@@ -49,6 +52,8 @@ export interface FlowDefinition {
     name: string;
     description: string;
     steps: AnyStep[];
+    autorun?: string | boolean;
+    lastRun?: string;
 }
 
 /**
@@ -170,15 +175,27 @@ export function parseSimpleFlowDefinition(text: string, app: App): FlowDefinitio
         return new Error('Simple flow must include at least one step.');
     }
 
+    const autorunValue = topLevel['autorun'];
+    const lastRunValue = topLevel['lastRun'];
+
     return {
         name: topLevel['name'],
         description: topLevel['description'],
-        steps
+        steps,
+        autorun: autorunValue === 'true' ? true : autorunValue,
+        lastRun: lastRunValue
     } as FlowDefinition;
 }
 
 export function parseFlowDefinition(text: string, app: App): FlowDefinition | Error {
     return parseSimpleFlowDefinition(text, app);
+}
+
+function getLocalYYYYMMDD(date: Date): string {
+    const year = date.getFullYear();
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
 }
 
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
@@ -230,6 +247,8 @@ export default class AutoflowPlugin extends Plugin {
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new AutoflowSettingTab(this.app, this));
+
+		this.runStartupFlows();
 	}
 
 	onunload() {
@@ -280,7 +299,7 @@ export default class AutoflowPlugin extends Plugin {
 			if (this.settings.showFlowConfirmation) {
 				new FlowSummaryModal(this.app, flowDefinition, this).open();
 			} else {
-				await this.runSteps(flowDefinition);
+				await this.runSteps(flowDefinition, file.path);
 			}
 		});
 		modal.open();
@@ -295,6 +314,58 @@ export default class AutoflowPlugin extends Plugin {
 			const count = await this.rebuildIndexForFolder(folder.path);
 			new Notice(`Rebuilding index for ${folder.path} complete. ${count} files indexed.`);
 		}).open();
+	}
+
+	async runStartupFlows() {
+		const today = getLocalYYYYMMDD(new Date());
+		for (const path of this.settings.autorunFlows) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile)) {
+				//console.warn(`Autoflow: Autorun file not found or is a folder: ${path}. Skipping.`);
+				continue;
+			}
+
+			const content = await this.app.vault.cachedRead(file);
+			const definition = parseFlowDefinition(content, this.app);
+
+			if (definition instanceof Error) {
+				console.error(`Autoflow: Failed to parse autorun flow ${path}:`, definition.message);
+				new Notice(`Autoflow: Error in autorun flow ${file.name}. See console.`);
+				continue;
+			}
+
+			if (definition.lastRun === today) {
+				continue;
+			}
+
+			if (definition.autorun === 'daily' || definition.autorun === true) {
+				try {
+					new Notice(`Autoflow: Running startup flow "${definition.name}"...`);
+					await this.runSteps(definition, path, true);
+				} catch (e) {
+					console.error(`Autoflow: Startup flow ${definition.name} failed:`, e);
+					new Notice(`Autoflow: Startup flow "${definition.name}" failed.`);
+					await this.logError(e);
+				}
+			}
+		}
+	}
+
+	async updateLastRunInFile(filePath: string, newDate: string) {
+		const file = this.app.vault.getAbstractFileByPath(filePath);
+		if (!(file instanceof TFile)) return;
+
+		let content = await this.app.vault.read(file);
+		const lastRunRegex = /^lastRun:\s*.*$/m;
+		const newLastRun = `lastRun: ${newDate}`;
+
+		if (lastRunRegex.test(content)) {
+			content = content.replace(lastRunRegex, newLastRun);
+		} else {
+			content = content.replace(/^(steps:.*)$/m, `${newLastRun}\n$1`);
+		}
+
+		await this.app.vault.modify(file, content);
 	}
 
 	async rebuildIndexForFolder(folderPath: string): Promise<number> {
@@ -332,7 +403,15 @@ ${error.stack}
 		await this.app.vault.adapter.append(logPath, logMessage);
 	}
 
-	async runSteps(definition: FlowDefinition) {
+	async runSteps(definition: FlowDefinition, filePath?: string, isAutorun = false) {
+		if (filePath && definition.autorun && !isAutorun) {
+			if (!this.settings.autorunFlows.includes(filePath)) {
+				this.settings.autorunFlows.push(filePath);
+				await this.saveSettings();
+				new Notice(`Registered ${definition.name} to autorun daily.`);
+			}
+		}
+
 		this.statusBar = this.addStatusBarItem();
 		this.statusBar.setText('Autoflow: Running...');
 		const context: Record<string, unknown> = {};
@@ -352,6 +431,9 @@ ${error.stack}
 				}
 			}
 			new Notice('Flow execution finished.');
+			if (filePath && isAutorun) {
+				await this.updateLastRunInFile(filePath, getLocalYYYYMMDD(new Date()));
+			}
 		} catch (error) {
 			new Notice('Flow execution failed. See logs for details.');
 			console.error('Autoflow execution error:', error);
@@ -491,7 +573,7 @@ ${error.stack}
 			return;
 		}
 
-		const targetFile = step.targetFile.replace('{{date}}', new Date().toISOString().split('T')[0]);
+		const targetFile = step.targetFile.replace('{{date}}', getLocalYYYYMMDD(new Date()));
 		const directoryPath = targetFile.substring(0, targetFile.lastIndexOf('/'));
 
 		if (directoryPath && !this.app.vault.getAbstractFileByPath(directoryPath)) {
@@ -622,35 +704,31 @@ class FlowPickerModal extends SuggestModal<TFile> {
 }
 
 class FlowSummaryModal extends Modal {
-	constructor(app: App, private flowDefinition: FlowDefinition, private plugin: AutoflowPlugin) {
+	constructor(app: App, private flowDefinition: FlowDefinition & { filePath?: string }, private plugin: AutoflowPlugin) {
 		super(app);
 	}
 
 	onOpen() {
 		const { contentEl, titleEl } = this;
-
 		titleEl.setText(`Flow: ${this.flowDefinition.name}`);
 
 		contentEl.createEl('p', { text: this.flowDefinition.description });
 
-		contentEl.createEl('h3', { text: 'Steps' });
-		const stepsEl = contentEl.createEl('ol');
-		for (const step of this.flowDefinition.steps) {
-			const stepLi = stepsEl.createEl('li');
-			stepLi.createEl('strong', { text: `Type: ${step.type}` });
-			const detailsUl = stepLi.createEl('ul');
-			for (const [key, value] of Object.entries(step)) {
-				if (key === 'type') continue;
-				detailsUl.createEl('li', { text: `${key}: ${value}` });
-			}
+		if (this.flowDefinition.autorun) {
+			contentEl.createEl('p', { text: 'This flow is set to run automatically every day.' });
 		}
 
-		const buttonContainer = contentEl.createDiv({ cls: 'autoflow-modal-buttons' });
-		const runButton = buttonContainer.createEl('button', { text: 'Run Flow', cls: 'mod-cta' });
-		runButton.addEventListener('click', () => {
-			this.plugin.runSteps(this.flowDefinition);
-			this.close();
-		});
+		contentEl.createEl('h4', { text: 'Steps' });
+		const list = contentEl.createEl('ul');
+		for (const step of this.flowDefinition.steps) {
+			list.createEl('li', { text: `${step.type}` });
+		}
+
+		contentEl.createEl('button', { text: 'Run Flow' })
+			.addEventListener('click', () => {
+				this.close();
+				this.plugin.runSteps(this.flowDefinition, this.flowDefinition.filePath);
+			});
 	}
 
 	onClose() {
