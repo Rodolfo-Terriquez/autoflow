@@ -9,6 +9,7 @@ Autoflow allows you to chain together steps to search for notes, transform their
 *   **Custom AI Flows:** Define multi-step workflows within your Markdown notes.
 *   **Semantic Search:** Uses AI embeddings to find notes based on conceptual meaning, not just keywords.
 *   **AI-Powered Content Transformation:** Leverage large language models to summarize, analyze, or reformat your notes.
+*   **External Prompts:** Reference a prompt from another Markdown file, keeping your flow definitions clean and reusable.
 *   **Dynamic File Naming:** Automatically include the current date in output filenames.
 *   **Manual Index Control:** A command to manually rebuild the AI search index for any folder.
 
@@ -96,6 +97,37 @@ Here is a complete example of a flow that finds all meeting notes from the past 
 
 After the flow completes, a new file named `Weekly-Summary-YYYY-MM-DD.md` will be created in your `Company/Reports` folder with the AI-generated summary.
 
+## Example Flow: Using an External Prompt File
+
+For complex prompts, you can store the prompt in a separate file and reference it from your flow. This keeps your flow definition tidy and makes it easy to reuse prompts across different flows.
+
+1.  **Create the Prompt File:** Create a file named `Summarizer Prompt.md` in a `Prompts` folder with your detailed prompt instructions:
+
+    ```markdown
+    You are an expert analyst. Review the following documents and provide a one-page summary. Focus on identifying the core arguments, key evidence presented, and any unresolved questions. Structure your output with clear headings for each section.
+    ```
+
+2.  **Create the Flow File:** Create a file named `External Prompt Flow.md` that references the prompt file:
+
+    ```text
+    autoflow
+    name: Generate Summary From File
+    description: "Searches for notes and summarizes them using a prompt from another file."
+    steps:
+    type: search
+    - sourceFolder: "Sources/Project-Alpha"
+    type: transform
+    - promptFile: "Prompts/Summarizer Prompt.md"
+    type: write
+    - targetFile: "Summaries/Project-Alpha-Summary-{{date}}.md"
+    ```
+3.  **Run the Flow:**
+    *   Open the Command Palette (`Cmd+P`).
+    *   Run the **`Run Autoflow`** command.
+    *   Select `External Prompt Flow.md`.
+
+The plugin will read `Prompts/Summarizer Prompt.md`, use its content as the prompt for the transform step, and write the output to the specified target file.
+
 ## Flow Commands & Parameters
 
 Below is a reference of all commands (step types) you can use inside an **Autoflow** definition and the parameters each one accepts.
@@ -115,7 +147,8 @@ Below is a reference of all commands (step types) you can use inside an **Autofl
    * `query` (string, optional) – semantic-search query. If omitted, all markdown files in `sourceFolder` are returned.
 
 2. **transform** – run an AI prompt on the collected content
-   * `prompt` (string, required) – the text sent to the AI model. The notes found in previous steps are appended automatically.
+   * `prompt` (string, conditional) – the text sent to the AI model. Required if `promptFile` is not used.
+   * `promptFile` (string, conditional) – path to a Markdown file containing the prompt. Required if `prompt` is not used. The notes found in previous steps are appended automatically to the content of the file.
 
 3. **write** – save the AI output
    * `targetFile` (string, required) – full path of the file to create/append (e.g. `"Reports/Summary-{{date}}.md"`). Supports `{{date}}` placeholder.

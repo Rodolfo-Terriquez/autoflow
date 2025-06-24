@@ -34,7 +34,8 @@ export interface SearchStep extends FlowStep {
 
 export interface TransformStep extends FlowStep {
     type: 'transform';
-    prompt: string;
+    prompt?: string;
+    promptFile?: string;
 }
 
 export interface WriteStep extends FlowStep {
@@ -66,7 +67,7 @@ export interface FlowDefinition {
  * type: write
  * - targetFile: "path"
  */
-export function parseSimpleFlowDefinition(text: string): FlowDefinition | Error {
+export function parseSimpleFlowDefinition(text: string, app: App): FlowDefinition | Error {
     const lines = text.split(/\r?\n/).map(l => l.trim());
 
     // Filter out empty comment lines if any
@@ -140,6 +141,27 @@ export function parseSimpleFlowDefinition(text: string): FlowDefinition | Error 
         steps.push(currentStep as unknown as AnyStep);
     }
 
+    for (const step of steps) {
+        if (step.type === 'transform') {
+            const transformStep = step as TransformStep;
+            if (transformStep.prompt && transformStep.promptFile) {
+                return new Error('Transform step cannot have both prompt and promptFile.');
+            }
+            if (!transformStep.prompt && !transformStep.promptFile) {
+                return new Error('Transform step must have either prompt or promptFile.');
+            }
+            if (transformStep.promptFile) {
+                const promptFile = app.vault.getAbstractFileByPath(transformStep.promptFile);
+                if (!promptFile) {
+                    return new Error(`Prompt file not found: ${transformStep.promptFile}`);
+                }
+                if (!(promptFile instanceof TFile)) {
+                    return new Error(`Prompt file path is a folder: ${transformStep.promptFile}`);
+                }
+            }
+        }
+    }
+
     if (!topLevel['name'] || !topLevel['description']) {
         return new Error('Simple flow must have name and description.');
     }
@@ -155,8 +177,8 @@ export function parseSimpleFlowDefinition(text: string): FlowDefinition | Error 
     } as FlowDefinition;
 }
 
-export function parseFlowDefinition(text: string): FlowDefinition | Error {
-    return parseSimpleFlowDefinition(text);
+export function parseFlowDefinition(text: string, app: App): FlowDefinition | Error {
+    return parseSimpleFlowDefinition(text, app);
 }
 
 function cosineSimilarity(vecA: number[], vecB: number[]): number {
@@ -184,6 +206,7 @@ export default class AutoflowPlugin extends Plugin {
 	openai: OpenAI;
 	embeddingIndex: EmbeddingIndex = {};
 	embeddingIndexPath: string;
+	statusBar: HTMLElement;
 
 	async onload() {
 		await this.loadSettings();
@@ -246,8 +269,8 @@ export default class AutoflowPlugin extends Plugin {
 	async pickAndRunFlow() {
 		const files = this.app.vault.getMarkdownFiles();
 		const modal = new FlowPickerModal(this.app, files, async (file) => {
-			const content = await this.app.vault.read(file);
-			const flowDefinition = parseFlowDefinition(content);
+			const content = await this.app.vault.cachedRead(file);
+			const flowDefinition = parseFlowDefinition(content, this.app);
 
 			if (flowDefinition instanceof Error) {
 				new Notice(`Invalid flow in ${file.name}: ${flowDefinition.message}. Ensure it starts with the 'autoflow' header.`);
@@ -310,8 +333,8 @@ ${error.stack}
 	}
 
 	async runSteps(definition: FlowDefinition) {
-		const statusBar = this.addStatusBarItem();
-		statusBar.setText('Autoflow: Running...');
+		this.statusBar = this.addStatusBarItem();
+		this.statusBar.setText('Autoflow: Running...');
 		const context: Record<string, unknown> = {};
 
 		try {
@@ -336,7 +359,7 @@ ${error.stack}
 				await this.logError(error);
 			}
 		} finally {
-			statusBar.remove();
+			this.statusBar.remove();
 		}
 	}
 
@@ -414,29 +437,47 @@ ${error.stack}
 	}
 
 	async executeTransformStep(step: TransformStep, context: Record<string, unknown>) {
-		const searchResults = context.searchResults as string[] || [];
-		let content = searchResults.join('\\n\\n---\\n\\n');
-
-		if (content.length > 8000) {
-			content = content.substring(0, 8000);
-		}
-
-		const prompt = `${step.prompt}\\n\\n${content}`;
-
-		if (!this.settings.apiKey) {
-			new Notice('OpenAI API key not set.');
+		const sourceContent = (context.searchResults as string[]) || [];
+		if (sourceContent.length === 0) {
+			new Notice('Transform step has no source content to process.');
 			return;
 		}
+
+		// Truncate if needed
+		const truncatedContent = sourceContent.join('\n\n').substring(0, 8000);
+
+		let finalPrompt = '';
+
+		if (step.promptFile) {
+			const promptFile = this.app.vault.getAbstractFileByPath(step.promptFile);
+			if (promptFile && promptFile instanceof TFile) {
+				const promptContent = await this.app.vault.cachedRead(promptFile);
+				finalPrompt = `${promptContent}\n\n---\n\n${truncatedContent}`;
+			} else {
+				// This should have been caught in parsing, but as a safeguard:
+				throw new Error(`Prompt file not found or is a directory: ${step.promptFile}`);
+			}
+		} else {
+			finalPrompt = `${step.prompt}\n\n---\n\n${truncatedContent}`;
+		}
+
+		this.statusBar.setText('Autoflow: Thinking...');
+
 		try {
 			const response = await this.openai.chat.completions.create({
 				model: this.settings.model,
 				temperature: this.settings.temperature,
 				messages: [
-					{ role: 'user', content: prompt }
+					{ role: 'user', content: finalPrompt }
 				]
 			});
 
-			context.transformResult = response.choices[0].message.content;
+			const result = response.choices[0].message?.content;
+			if (result) {
+				context.transformResult = result;
+			} else {
+				new Notice('Transform step returned no result.');
+			}
 		} catch (error) {
 			new Notice('OpenAI API Error. See console for details.');
 			console.error('OpenAI API Error:', error);
